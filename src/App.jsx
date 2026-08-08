@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { supabase } from "./supabaseClient";
 
 // ---------- Design tokens ----------
 const COLORS = {
@@ -40,6 +41,26 @@ function emptyBinder(name) {
     pages: [emptyPage(3, 3)],
   };
 }
+
+// ---- Sets- und Namens-Cache bleiben lokal auf dem Gerät (kein Nutzerbezug nötig) ----
+const localCache = {
+  get(key) {
+    try {
+      const raw = window.localStorage.getItem(key);
+      return raw ? { value: raw } : null;
+    } catch (e) {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+};
 
 // Compress an uploaded image to keep storage small
 function fileToCompressedDataUrl(file, maxDim = 480, quality = 0.82) {
@@ -129,6 +150,14 @@ function normalizeLoadedData(parsed) {
 }
 
 export default function App() {
+  const [session, setSession] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authMode, setAuthMode] = useState("login"); // login | signup
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
   const [binders, setBinders] = useState([emptyBinder("Mein Binder")]);
   const [binderIndex, setBinderIndex] = useState(0);
   const [pageIndex, setPageIndex] = useState(0);
@@ -156,51 +185,114 @@ export default function App() {
   const [germanMapLoading, setGermanMapLoading] = useState(false);
   const [germanMapProgress, setGermanMapProgress] = useState(null); // {done, total}
 
-  // ---- Load persisted binders ----
+  // ---- Auth: watch Supabase session ----
   useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthChecked(true);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => {
+      setSession(sess);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  async function handleAuthSubmit() {
+    setAuthError("");
+    if (!authEmail.trim() || !authPassword.trim()) {
+      setAuthError("Bitte E-Mail und Passwort eingeben.");
+      return;
+    }
+    setAuthBusy(true);
+    try {
+      if (authMode === "signup") {
+        const { error } = await supabase.auth.signUp({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (error) throw error;
+        setAuthError("Konto erstellt. Falls E-Mail-Bestätigung aktiv ist, prüfe dein Postfach, dann einloggen.");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: authEmail.trim(),
+          password: authPassword,
+        });
+        if (error) throw error;
+      }
+    } catch (e) {
+      setAuthError(e.message || "Etwas ist schiefgelaufen.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setBinders([emptyBinder("Mein Binder")]);
+    setLoaded(false);
+  }
+
+  // ---- Load binders from Supabase once logged in ----
+  useEffect(() => {
+    if (!session) return;
     (async () => {
       try {
-        const res = await window.storage.get("binder-data", false);
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          const normalized = normalizeLoadedData(parsed);
+        const { data, error } = await supabase
+          .from("user_binders")
+          .select("data")
+          .eq("user_id", session.user.id)
+          .maybeSingle();
+        if (error) throw error;
+        if (data && data.data) {
+          const normalized = normalizeLoadedData(data.data);
           if (normalized) setBinders(normalized);
+        } else {
+          // first login: create the row with a default binder
+          const initial = [emptyBinder("Mein Binder")];
+          setBinders(initial);
+          await supabase.from("user_binders").insert({
+            user_id: session.user.id,
+            data: initial,
+          });
         }
       } catch (e) {
-        // no saved data yet
+        console.error("Laden fehlgeschlagen", e);
       } finally {
         setLoaded(true);
       }
     })();
-  }, []);
+  }, [session]);
 
-  // ---- Persist on change ----
+  // ---- Persist to Supabase on change (debounced) ----
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !session) return;
     setSaving(true);
     const t = setTimeout(async () => {
       try {
-        await window.storage.set("binder-data", JSON.stringify(binders), false);
+        await supabase
+          .from("user_binders")
+          .update({ data: binders, updated_at: new Date().toISOString() })
+          .eq("user_id", session.user.id);
       } catch (e) {
         console.error("Speichern fehlgeschlagen", e);
       } finally {
         setSaving(false);
       }
-    }, 400);
+    }, 600);
     return () => clearTimeout(t);
-  }, [binders, loaded]);
+  }, [binders, loaded, session]);
 
   // ---- Load cached sets / German name map (if previously built) ----
   useEffect(() => {
     (async () => {
       try {
-        const res = await window.storage.get("tcg-sets-cache", false);
+        const res = localCache.get("tcg-sets-cache");
         if (res && res.value) setSetsList(JSON.parse(res.value));
       } catch (e) {
         /* not cached yet */
       }
       try {
-        const res = await window.storage.get("german-name-map", false);
+        const res = localCache.get("german-name-map");
         if (res && res.value) setGermanMap(JSON.parse(res.value));
       } catch (e) {
         /* not cached yet */
@@ -214,7 +306,7 @@ export default function App() {
     try {
       const sets = await fetchAllSets();
       setSetsList(sets);
-      await window.storage.set("tcg-sets-cache", JSON.stringify(sets), false);
+      localCache.set("tcg-sets-cache", JSON.stringify(sets));
     } catch (e) {
       // silently ignore - set filter just stays a free-text field
     } finally {
@@ -231,7 +323,7 @@ export default function App() {
         setGermanMapProgress({ done, total })
       );
       setGermanMap(map);
-      await window.storage.set("german-name-map", JSON.stringify(map), false);
+      localCache.set("german-name-map", JSON.stringify(map));
     } catch (e) {
       setSearchError("Deutsche Namen konnten nicht geladen werden.");
     } finally {
@@ -452,22 +544,28 @@ export default function App() {
     setSheet(null);
   }
 
-  if (!loaded) {
+  if (!authChecked) {
+    return <CenterMessage>Prüfe Login …</CenterMessage>;
+  }
+
+  if (!session) {
     return (
-      <div
-        style={{
-          background: COLORS.bg,
-          minHeight: "100vh",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: COLORS.textDim,
-          fontFamily: "system-ui, sans-serif",
-        }}
-      >
-        Lade Ordner …
-      </div>
+      <AuthScreen
+        mode={authMode}
+        setMode={setAuthMode}
+        email={authEmail}
+        setEmail={setAuthEmail}
+        password={authPassword}
+        setPassword={setAuthPassword}
+        error={authError}
+        busy={authBusy}
+        onSubmit={handleAuthSubmit}
+      />
     );
+  }
+
+  if (!loaded) {
+    return <CenterMessage>Lade deine Binder …</CenterMessage>;
   }
 
   return (
@@ -502,6 +600,19 @@ export default function App() {
           <span style={{ fontSize: 11, color: COLORS.textDim, marginLeft: "auto" }}>
             {saving ? "speichert …" : "gespeichert"}
           </span>
+          <button
+            onClick={handleLogout}
+            style={{
+              background: "none",
+              border: "none",
+              color: COLORS.textDim,
+              fontSize: 11,
+              cursor: "pointer",
+              textDecoration: "underline",
+            }}
+          >
+            abmelden
+          </button>
         </div>
 
         {/* Binder switcher */}
@@ -913,6 +1024,88 @@ export default function App() {
           )}
         </Sheet>
       )}
+    </div>
+  );
+}
+
+function CenterMessage({ children }) {
+  return (
+    <div
+      style={{
+        background: COLORS.bg,
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: COLORS.textDim,
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function AuthScreen({ mode, setMode, email, setEmail, password, setPassword, error, busy, onSubmit }) {
+  return (
+    <div
+      style={{
+        background: COLORS.bg,
+        minHeight: "100vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif",
+        padding: 20,
+      }}
+    >
+      <div style={{ width: "100%", maxWidth: 360 }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <span style={{ fontWeight: 800, fontSize: 26, color: COLORS.text }}>
+            Karten<span style={{ color: COLORS.gold }}>Bindr</span>
+          </span>
+          <p style={{ color: COLORS.textDim, fontSize: 13, marginTop: 6 }}>
+            {mode === "signup" ? "Konto erstellen" : "Anmelden"}, um deine Binder überall zu sehen.
+          </p>
+        </div>
+
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="E-Mail"
+          style={{ ...inputStyle, width: "100%", boxSizing: "border-box", marginBottom: 10 }}
+        />
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && onSubmit()}
+          placeholder="Passwort"
+          style={{ ...inputStyle, width: "100%", boxSizing: "border-box", marginBottom: 14 }}
+        />
+
+        {error && (
+          <p style={{ color: COLORS.gold, fontSize: 12, marginBottom: 10 }}>{error}</p>
+        )}
+
+        <button
+          onClick={onSubmit}
+          disabled={busy}
+          style={{ ...primaryBtnStyle, width: "100%", padding: "12px 16px", fontSize: 14 }}
+        >
+          {busy ? "Bitte warten …" : mode === "signup" ? "Konto erstellen" : "Anmelden"}
+        </button>
+
+        <button
+          onClick={() => setMode(mode === "signup" ? "login" : "signup")}
+          style={{ ...linkBtnStyle, textAlign: "center", width: "100%", marginTop: 14 }}
+        >
+          {mode === "signup"
+            ? "Schon ein Konto? Hier anmelden"
+            : "Noch kein Konto? Hier erstellen"}
+        </button>
+      </div>
     </div>
   );
 }
